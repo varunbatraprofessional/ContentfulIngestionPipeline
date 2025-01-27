@@ -6,10 +6,10 @@ from requests.exceptions import RequestException
 
 # Database connection details
 
-DB_HOST = "xxx"
+DB_HOST = "xxxx"
 DB_NAME = "BarTakerDB"
 DB_USER = "postgres"
-DB_PASSWORD = "xxx"
+DB_PASSWORD = "xxxx"
 
 # Contentful connection details
 SPACE_ID = "hxu8jsem6qms"
