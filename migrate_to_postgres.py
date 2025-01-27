@@ -6,15 +6,15 @@ from requests.exceptions import RequestException
 
 # Database connection details
 
-DB_HOST = "bartaker-encrypted-2.cvmyym82q7cm.us-east-2.rds.amazonaws.com"
+DB_HOST = "xxx"
 DB_NAME = "BarTakerDB"
-DB_USER = "postgres"
-DB_PASSWORD = "xxxxxx"
+DB_USER = "bartaker_admin"
+DB_PASSWORD = "xxxx"
 
 # Contentful connection details
 SPACE_ID = "hxu8jsem6qms"
 ENVIRONMENT_ID = "master"  # Replace if using a different environment
-ACCESS_TOKEN = "xxxxxx"
+ACCESS_TOKEN = "xxxx"
 
 # Create a Contentful client instance with longer timeout
 client = Client(
@@ -69,9 +69,13 @@ def insert_data(cursor, table_name, data_dict):
                     v2.{table_name}.option_id = EXCLUDED.option_id AND
                     (v2.{table_name}.option_text != EXCLUDED.option_text OR
                      v2.{table_name}.is_correct != EXCLUDED.is_correct)
-                RETURNING option_id
+                RETURNING option_id, question_id, is_correct
             )
-            SELECT * FROM updated_option
+            UPDATE v2.user_answers ua
+            SET is_correct = uo.is_correct
+            FROM updated_option uo
+            WHERE ua.chosen_answer_id = uo.option_id
+            AND EXISTS (SELECT 1 FROM updated_option)
         """
     elif table_name == 'questions':
         query = f"""
@@ -162,6 +166,37 @@ def get_paginated_entries(client, content_type, batch_size=100):
             
     return all_entries
 
+def delete_stale_data(cursor, table_name, active_ids):
+    """
+    Delete records that exist in the database but not in Contentful
+    Args:
+        cursor: Database cursor
+        table_name: Name of the table to clean up
+        active_ids: Set of UUIDs that are currently active in Contentful
+    """
+    id_column = f"{table_name[:-1] if table_name != 'quiz' else 'quiz'}_id"
+    
+    # Special handling for quiz_questions table
+    if table_name == 'quiz_questions':
+        cursor.execute(f"""
+            DELETE FROM v2.{table_name}
+            WHERE (quiz_id, question_id) NOT IN (
+                SELECT quiz_id, question_id 
+                FROM unnest(%s::uuid[], %s::uuid[]) AS t(quiz_id, question_id)
+            )
+        """, ([x[0] for x in active_ids], [x[1] for x in active_ids]))
+    else:
+        cursor.execute(f"""
+            DELETE FROM v2.{table_name}
+            WHERE {id_column} NOT IN (
+                SELECT unnest(%s::uuid[])
+            )
+        """, (list(active_ids),))
+    
+    deleted_count = cursor.rowcount
+    print(f"Deleted {deleted_count} stale records from {table_name}")
+    return deleted_count
+
 # Insert Contentful data into the PostgreSQL schema with proper foreign key handling
 def insert_contentful_data():
     print("Starting to insert data")
@@ -173,13 +208,22 @@ def insert_contentful_data():
     cursor = conn.cursor()
 
     try:
+        # Track active IDs for each table
+        active_subject_ids = set()
+        active_topic_ids = set()
+        active_subtopic_ids = set()
+        active_question_ids = set()
+        active_option_ids = set()
+        active_quiz_ids = set()
+        active_quiz_question_pairs = set()  # Will store (quiz_id, question_id) tuples
+
         # Insert data in the correct order to satisfy foreign key constraints
         # Step 1: Insert Subjects with retry logic
         print("Fetching subjects...")
         subject_entries = get_paginated_entries(client, '2UVKc9N9FTQ9lfqyfwQaGl')
         for subject in subject_entries:
-            # Use the Contentful ID as the primary key
             subject_id = convert_to_uuid(subject.sys['id'])
+            active_subject_ids.add(subject_id)
             is_free = False
             if subject.name == 'Evidence':
                 is_free = True
@@ -189,10 +233,11 @@ def insert_contentful_data():
         print("Fetching topics...")
         topic_entries = get_paginated_entries(client, '60H8p8k0YxbzjCVXs30xEA')
         for topic in topic_entries:
+            topic_id = convert_to_uuid(topic.sys['id'])
+            active_topic_ids.add(topic_id)
             # Get the subject UUID based on the Contentful ID reference
             subject_id = get_uuid_by_id(cursor, "subjects", convert_to_uuid(topic.raw['fields']['subjectReference']['sys']['id']))
             if subject_id:
-                topic_id = convert_to_uuid(topic.sys['id'])
                 insert_data(cursor, 'topics', {
                     'topic_id': topic_id,
                     'topic_name': topic.name,
@@ -207,10 +252,11 @@ def insert_contentful_data():
 
         # Insert Subtopics
         for subtopic in subtopic_entries:
+            subtopic_id = convert_to_uuid(subtopic.sys['id'])
+            active_subtopic_ids.add(subtopic_id)
             # Get the topic UUID based on the Contentful ID reference
             topic_id = get_uuid_by_id(cursor, "topics", convert_to_uuid(subtopic.raw['fields']['topicReference']['sys']['id']))
             if topic_id:
-                subtopic_id = convert_to_uuid(subtopic.sys['id'])
                 insert_data(cursor, 'subtopics', {
                     'subtopic_id': subtopic_id,
                     'subtopic_name': subtopic.name,
@@ -220,12 +266,12 @@ def insert_contentful_data():
 
         # Insert Issues as children of Subtopics
         for issue in issue_entries:
+            issue_id = convert_to_uuid(issue.sys['id'])
+            active_subtopic_ids.add(issue_id)
             # Get the parent subtopic UUID based on the Contentful ID reference
             parent_subtopic_id = get_uuid_by_id(cursor, "subtopics", convert_to_uuid(issue.raw['fields']['subtopicReference']['sys']['id']))
             if parent_subtopic_id:
-                issue_id = convert_to_uuid(issue.sys['id'])
-
-                # Get the topic_id of the parent subtopic
+                # Retrieve the topic_id of the parent subtopic
                 cursor.execute(
                     "SELECT topic_id FROM v2.subtopics WHERE subtopic_id = %s",
                     (parent_subtopic_id,)
@@ -240,7 +286,6 @@ def insert_contentful_data():
                 })
 
         # Step 4: Process Questions
-        question_ids = set()
         count = 0
         for content_type in ['multipleChoiceQuestion', 'trueFalseQuestion']:
             print(f"Fetching {content_type}...")
@@ -250,7 +295,7 @@ def insert_contentful_data():
             for question in entries:
                 count += 1
                 question_id = convert_to_uuid(question.sys['id'])
-                question_ids.add(question_id)
+                active_question_ids.add(question_id)
                 
                 # Process question (existing question processing logic here)
                 question_text = question.raw['fields']['questionText']
@@ -305,6 +350,7 @@ def insert_contentful_data():
                         answer_id = answer['sys']['id']
                         entity = client.entries({'sys.id[in]': answer_id})
                         option_id = convert_to_uuid(answer_id)
+                        active_option_ids.add(option_id)
                         entity = entity[0]
                         insert_data(cursor, 'options', {
                             'option_id': option_id,
@@ -316,6 +362,7 @@ def insert_contentful_data():
                     for option in ['True', 'False']:
                         # Create a deterministic ID by combining question ID and T/F value
                         option_id = convert_to_uuid(f"{question.sys['id']}_{option}")
+                        active_option_ids.add(option_id)
                         isCorrectAnswer = str(question.raw['fields']['correctAnswer']).lower() == option.lower()
                         insert_data(cursor, 'options', {
                             'option_id': option_id,
@@ -340,12 +387,13 @@ def insert_contentful_data():
                         (question.raw['fields']['answerExplanation'], question_id)
                     )
 
-        print(f"Total number of questions processed: {len(question_ids)}")
+        print(f"Total number of questions processed: {len(active_question_ids)}")
 
         # Step 6: Insert Quizzes
         quiz_entries = client.entries({'content_type': '4W0to1SsFsewSPWUfFJzGC'})  # Replace with your Contentful quiz content type ID
         for quiz in quiz_entries:
             quiz_id = convert_to_uuid(quiz.sys['id'])
+            active_quiz_ids.add(quiz_id)
             quiz_name = quiz.raw['fields']['name']
             
             # Optional links to subject, topic, and subtopic based on hierarchy level
@@ -376,8 +424,8 @@ def insert_contentful_data():
                 questions = quiz.raw['fields']['questions']
                 for order, question_ref in enumerate(questions):
                     question_id = convert_to_uuid(question_ref['sys']['id'])
-                    # Only insert if the question exists in our questions table
-                    if question_id in question_ids:
+                    if question_id in active_question_ids:
+                        active_quiz_question_pairs.add((quiz_id, question_id))
                         insert_data(cursor, 'quiz_questions', {
                             'quiz_id': quiz_id,
                             'question_id': question_id,
@@ -386,8 +434,49 @@ def insert_contentful_data():
                     else:
                         print(f"Warning: Question {question_id} not found in questions table. Skipping.")
 
-        print("Contentful data successfully inserted into the database!")
+        print("Contentful data successfully synchronized with the database!")
         print(count)
+
+        # Clean up stale data in the correct order to respect foreign key constraints
+        print("\nCleaning up stale data...")
+        # First delete quiz_questions (no dependencies)
+        delete_stale_data(cursor, 'quiz_questions', active_quiz_question_pairs)
+        
+        # Delete quiz entries (no dependencies)
+        delete_stale_data(cursor, 'quiz', active_quiz_ids)
+        
+        # Delete user_answers that reference stale options
+        cursor.execute("""
+            DELETE FROM v2.user_answers
+            WHERE chosen_answer_id NOT IN (
+                SELECT unnest(%s::uuid[])
+            )
+        """, (list(active_option_ids),))
+        print(f"Deleted {cursor.rowcount} stale user answers")
+        
+        # Now we can safely delete options
+        delete_stale_data(cursor, 'options', active_option_ids)
+        
+        # Delete questions (will cascade to user_answers)
+        delete_stale_data(cursor, 'questions', active_question_ids)
+        
+        # Delete subtopics (will cascade to questions)
+        delete_stale_data(cursor, 'subtopics', active_subtopic_ids)
+        
+        # Delete topics (will cascade to subtopics)
+        delete_stale_data(cursor, 'topics', active_topic_ids)
+        
+        # Delete subscriptions that reference stale subjects
+        cursor.execute("""
+            DELETE FROM v2.subscriptions
+            WHERE subject_id NOT IN (
+                SELECT unnest(%s::uuid[])
+            )
+        """, (list(active_subject_ids),))
+        print(f"Deleted {cursor.rowcount} stale subscriptions")
+        
+        # Finally delete subjects
+        delete_stale_data(cursor, 'subjects', active_subject_ids)
 
         # Close the cursor and connection after data insertion
         cursor.close()
