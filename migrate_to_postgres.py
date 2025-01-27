@@ -6,9 +6,9 @@ from requests.exceptions import RequestException
 
 # Database connection details
 
-DB_HOST = "xxxx"
+DB_HOST = "xxx"
 DB_NAME = "BarTakerDB"
-DB_USER = "postgres"
+DB_USER = "bartaker_admin"
 DB_PASSWORD = "xxxx"
 
 # Contentful connection details
